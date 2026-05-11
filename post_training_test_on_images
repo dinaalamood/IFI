@@ -1,0 +1,564 @@
+# test_evaluation.py
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader
+import numpy as np
+from tqdm import tqdm
+from pathlib import Path
+import json
+import cv2
+import matplotlib.pyplot as plt
+from datetime import datetime
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
+
+# Import your model classes (copy from training script)
+class DecoderBlock(nn.Module):
+    """U-Net decoder block with adaptive spatial matching"""
+    def __init__(self, in_channels, skip_channels, out_channels):
+        super().__init__()
+        self.conv1 = nn.Conv2d(in_channels + skip_channels, out_channels, 3, padding=1)
+        self.bn1 = nn.BatchNorm2d(out_channels)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, 3, padding=1)
+        self.bn2 = nn.BatchNorm2d(out_channels)
+        self.relu = nn.ReLU(inplace=True)
+        
+    def forward(self, x, skip=None):
+        x = nn.functional.interpolate(x, scale_factor=2, mode='bilinear', align_corners=True)
+        
+        if skip is not None:
+            if x.shape[2:] != skip.shape[2:]:
+                skip = nn.functional.interpolate(skip, size=x.shape[2:], mode='bilinear', align_corners=True)
+            x = torch.cat([x, skip], dim=1)
+            
+        x = self.relu(self.bn1(self.conv1(x)))
+        x = self.relu(self.bn2(self.conv2(x)))
+        return x
+
+class SwinFeatureExtractor(nn.Module):
+    """Wrapper to extract multi-scale features from Swin Transformer"""
+    def __init__(self, swin_model):
+        super().__init__()
+        self.patch_embed = swin_model.patch_embed
+        self.layers = swin_model.layers
+        
+        if hasattr(swin_model, 'pos_drop'):
+            self.pos_drop = swin_model.pos_drop
+        else:
+            self.pos_drop = nn.Identity()
+            
+        if hasattr(swin_model, 'norm'):
+            self.norm = swin_model.norm
+        else:
+            self.norm = nn.Identity()
+        
+    def forward(self, x):
+        """Extract features from each stage"""
+        features = []
+        
+        x = self.patch_embed(x)
+        if hasattr(self, 'pos_drop'):
+            x = self.pos_drop(x)
+        
+        for i, layer in enumerate(self.layers):
+            x = layer(x)
+            
+            if len(x.shape) == 4:
+                feature = x.permute(0, 3, 1, 2).contiguous()
+            else:
+                B, L, C = x.shape
+                H = W = int(L ** 0.5)
+                feature = x.view(B, H, W, C).permute(0, 3, 1, 2).contiguous()
+            
+            features.append(feature)
+        
+        return features
+
+class SwinUNet(nn.Module):
+    """U-Net with Swin Transformer encoder and custom decoder"""
+    def __init__(self, encoder_name='swin_base_patch4_window7_224', 
+                 encoder_channels=[128, 256, 512, 1024], num_classes=1):
+        super().__init__()
+        
+        import timm
+        
+        # Create full Swin Transformer model
+        full_model = timm.create_model(
+            encoder_name,
+            pretrained=False,
+            num_classes=0
+        )
+        
+        # Create feature extractor
+        self.encoder = SwinFeatureExtractor(full_model)
+        
+        # Build decoder
+        self.decoder4 = DecoderBlock(encoder_channels[3], encoder_channels[2], 512)
+        self.decoder3 = DecoderBlock(512, encoder_channels[1], 256)
+        self.decoder2 = DecoderBlock(256, encoder_channels[0], 128)
+        self.decoder1 = DecoderBlock(128, 0, 64)
+        
+        # Final segmentation head
+        self.segmentation_head = nn.Sequential(
+            nn.Conv2d(64, 32, 3, padding=1),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, num_classes, 1)
+        )
+    
+    def forward(self, x):
+        input_size = x.shape[2:]
+        
+        encoder_features = self.encoder(x)
+        
+        d4 = self.decoder4(encoder_features[3], encoder_features[2])
+        d3 = self.decoder3(d4, encoder_features[1])
+        d2 = self.decoder2(d3, encoder_features[0])
+        d1 = self.decoder1(d2)
+        
+        d1 = nn.functional.interpolate(d1, size=input_size, mode='bilinear', align_corners=True)
+        
+        out = self.segmentation_head(d1)
+        
+        return out
+
+class ImprovedSolarDataset:
+    def __init__(self, image_paths, mask_paths, transform=None):
+        self.image_paths = image_paths
+        self.mask_paths = mask_paths
+        self.transform = transform
+    
+    def __len__(self):
+        return len(self.image_paths)
+    
+    def __getitem__(self, idx):
+        # Read original image for visualization
+        original_image = cv2.imread(self.image_paths[idx])
+        original_image = cv2.cvtColor(original_image, cv2.COLOR_BGR2RGB)
+        
+        # Read image for model
+        image = original_image.copy()
+        
+        mask = cv2.imread(self.mask_paths[idx], cv2.IMREAD_GRAYSCALE)
+        mask = (mask > 127).astype(np.float32)
+        
+        if self.transform:
+            augmented = self.transform(image=image, mask=mask)
+            image = augmented['image']
+            mask = augmented['mask']
+        
+        if len(mask.shape) == 2:
+            mask = mask.unsqueeze(0)
+        
+        return image, mask, self.image_paths[idx], original_image
+
+def get_test_augmentation(input_size):
+    """Test augmentation - only resize and normalize"""
+    return A.Compose([
+        A.Resize(input_size, input_size),
+        A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+        ToTensorV2(),
+    ])
+
+def dice_coefficient(pred, target, threshold=0.5):
+    """Calculate Dice coefficient"""
+    pred = torch.sigmoid(pred)
+    pred = (pred > threshold).float()
+    target = target.float()
+    
+    intersection = (pred * target).sum()
+    union = pred.sum() + target.sum()
+    
+    dice = (2. * intersection) / (union + 1e-8)
+    return dice.item()
+
+def iou_score(pred, target, threshold=0.5):
+    """Calculate IoU score"""
+    pred = torch.sigmoid(pred)
+    pred = (pred > threshold).float()
+    target = target.float()
+    
+    intersection = (pred * target).sum()
+    union = pred.sum() + target.sum() - intersection
+    
+    iou = intersection / (union + 1e-8)
+    return iou.item()
+
+def pixel_accuracy(pred, target, threshold=0.5):
+    """Calculate pixel accuracy"""
+    pred = torch.sigmoid(pred)
+    pred = (pred > threshold).float()
+    target = target.float()
+    
+    correct = (pred == target).float().sum()
+    total = target.numel()
+    
+    return (correct / total).item()
+
+def create_overlay_visualization(original_image, ground_truth, prediction, alpha=0.5):
+    """Create visualization with original image, ground truth, and prediction overlay"""
+    # Resize masks to match original image size
+    h, w = original_image.shape[:2]
+    ground_truth_resized = cv2.resize(ground_truth, (w, h), interpolation=cv2.INTER_NEAREST)
+    prediction_resized = cv2.resize(prediction, (w, h), interpolation=cv2.INTER_NEAREST)
+    
+    # Create colored overlays
+    # Ground truth: green
+    gt_overlay = original_image.copy()
+    gt_mask_color = np.zeros_like(original_image)
+    gt_mask_color[ground_truth_resized > 0.5] = [0, 255, 0]  # Green
+    gt_overlay = cv2.addWeighted(gt_overlay, 1-alpha, gt_mask_color, alpha, 0)
+    
+    # Prediction: blue
+    pred_overlay = original_image.copy()
+    pred_mask_color = np.zeros_like(original_image)
+    pred_mask_color[prediction_resized > 0.5] = [0, 0, 255]  # Blue
+    pred_overlay = cv2.addWeighted(pred_overlay, 1-alpha, pred_mask_color, alpha, 0)
+    
+    # Combined: green for GT, blue for pred, yellow for overlap
+    combined_overlay = original_image.copy()
+    combined_mask_color = np.zeros_like(original_image)
+    
+    # True positives (overlap): yellow
+    overlap = (ground_truth_resized > 0.5) & (prediction_resized > 0.5)
+    combined_mask_color[overlap] = [255, 255, 0]  # Yellow
+    
+    # False positives (pred only): red
+    fp = (ground_truth_resized <= 0.5) & (prediction_resized > 0.5)
+    combined_mask_color[fp] = [255, 0, 0]  # Red
+    
+    # False negatives (GT only): green
+    fn = (ground_truth_resized > 0.5) & (prediction_resized <= 0.5)
+    combined_mask_color[fn] = [0, 255, 0]  # Green
+    
+    combined_overlay = cv2.addWeighted(combined_overlay, 1-alpha, combined_mask_color, alpha, 0)
+    
+    return gt_overlay, pred_overlay, combined_overlay
+
+def save_visualization(original_image, ground_truth, prediction, dice, iou, 
+                       save_path, image_name):
+    """Save a comprehensive visualization"""
+    # Create overlays
+    gt_overlay, pred_overlay, combined_overlay = create_overlay_visualization(
+        original_image, ground_truth, prediction
+    )
+    
+    # Create figure
+    fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+    
+    # Row 1: Original, GT, Prediction
+    axes[0, 0].imshow(original_image)
+    axes[0, 0].set_title('Original Image')
+    axes[0, 0].axis('off')
+    
+    axes[0, 1].imshow(ground_truth, cmap='gray')
+    axes[0, 1].set_title('Ground Truth')
+    axes[0, 1].axis('off')
+    
+    axes[0, 2].imshow(prediction, cmap='gray')
+    axes[0, 2].set_title('Prediction')
+    axes[0, 2].axis('off')
+    
+    # Row 2: Overlays
+    axes[1, 0].imshow(gt_overlay)
+    axes[1, 0].set_title('GT Overlay (Green)')
+    axes[1, 0].axis('off')
+    
+    axes[1, 1].imshow(pred_overlay)
+    axes[1, 1].set_title('Pred Overlay (Blue)')
+    axes[1, 1].axis('off')
+    
+    axes[1, 2].imshow(combined_overlay)
+    axes[1, 2].set_title('Combined\n(Yellow=TP, Red=FP, Green=FN)')
+    axes[1, 2].axis('off')
+    
+    # Add metrics as text
+    fig.suptitle(f'{image_name}\nDice: {dice:.4f} | IoU: {iou:.4f}', 
+                 fontsize=14, fontweight='bold')
+    
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.close()
+
+def evaluate_test_set(model_path, base_save_dir, device='cpu'):
+    """Evaluate model on test set"""
+    
+    base_save_dir = Path(base_save_dir)
+    
+    # Create output directory with timestamp
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    output_dir = base_save_dir / f'test_evaluation_{timestamp}'
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Create subdirectories
+    viz_dir = output_dir / 'visualizations'
+    viz_dir.mkdir(exist_ok=True)
+    
+    viz_all_dir = viz_dir / 'all_predictions'
+    viz_all_dir.mkdir(exist_ok=True)
+    
+    viz_best_dir = viz_dir / 'best_predictions'
+    viz_best_dir.mkdir(exist_ok=True)
+    
+    viz_worst_dir = viz_dir / 'worst_predictions'
+    viz_worst_dir.mkdir(exist_ok=True)
+    
+    print(f"\nOutput will be saved to: {output_dir}")
+    print(f"Visualizations will be saved to: {viz_dir}")
+    
+    # Load dataset split info
+    from glob import glob
+    test_imgs = sorted(glob('/Users/dinaal-amood/Desktop/solar/amman_makesense/images/*.png'))  # or .jpg, .tif, etc.
+
+    print("Found", len(test_imgs), "test images")
+    print("Found", len(test_masks), "test masks")
+
+    assert len(test_imgs) > 0, "No images found — check your glob path and extension"
+    assert len(test_imgs) == len(test_masks), "Number of images and masks does not match"
+
+    
+    print(f"\nEvaluating on {len(test_imgs)} test images")
+    
+    # Load model
+    print(f"Loading model from {model_path}")
+    checkpoint = torch.load(model_path, map_location=device, weights_only=False)
+    
+    model = SwinUNet(
+        encoder_name='swin_base_patch4_window7_224',
+        encoder_channels=[128, 256, 512, 1024],
+        num_classes=1
+    )
+    model.load_state_dict(checkpoint['model_state_dict'])
+    model = model.to(device)
+    model.eval()
+    
+    print(f"Model loaded from epoch {checkpoint['epoch']}")
+    print(f"Validation Dice at checkpoint: {checkpoint['val_dice']:.4f}")
+    
+    # Create test dataset
+    input_size = 224  # Adjust if you used different size
+    test_dataset = ImprovedSolarDataset(
+        test_imgs, test_masks,
+        get_test_augmentation(input_size)
+    )
+    
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=1,
+        shuffle=False,
+        num_workers=0
+    )
+    
+    # Evaluate
+    test_dice_scores = []
+    test_iou_scores = []
+    test_accuracies = []
+    
+    results = []
+    predictions_data = []
+    
+    print("\nEvaluating test set and generating visualizations...")
+    with torch.no_grad():
+        for images, masks, paths, original_images in tqdm(test_loader):
+            images = images.to(device)
+            masks = masks.to(device)
+            
+            outputs = model(images)
+            
+            dice = dice_coefficient(outputs, masks)
+            iou = iou_score(outputs, masks)
+            acc = pixel_accuracy(outputs, masks)
+            
+            test_dice_scores.append(dice)
+            test_iou_scores.append(iou)
+            test_accuracies.append(acc)
+            
+            # Get prediction as numpy array
+            pred = torch.sigmoid(outputs).cpu().numpy()[0, 0]
+            gt = masks.cpu().numpy()[0, 0]
+            original_img = original_images[0].numpy()
+            
+            image_name = Path(paths[0]).stem
+            
+            # Save visualization for all images
+            save_visualization(
+                original_img, gt, pred, dice, iou,
+                viz_all_dir / f'{image_name}_dice{dice:.4f}.png',
+                image_name
+            )
+            
+            predictions_data.append({
+                'image_name': image_name,
+                'image_path': paths[0],
+                'dice': dice,
+                'iou': iou,
+                'accuracy': acc,
+                'prediction': pred,
+                'ground_truth': gt,
+                'original_image': original_img
+            })
+            
+            results.append({
+                'image_path': paths[0],
+                'dice': dice,
+                'iou': iou,
+                'accuracy': acc
+            })
+    
+    # Calculate statistics
+    mean_dice = np.mean(test_dice_scores)
+    std_dice = np.std(test_dice_scores)
+    mean_iou = np.mean(test_iou_scores)
+    std_iou = np.std(test_iou_scores)
+    mean_acc = np.mean(test_accuracies)
+    std_acc = np.std(test_accuracies)
+    
+    # Print results
+    print(f"\n{'='*60}")
+    print(f"TEST SET RESULTS")
+    print(f"{'='*60}")
+    print(f"Number of test images: {len(test_imgs)}")
+    print(f"\nDice Score:       {mean_dice:.4f} ± {std_dice:.4f}")
+    print(f"IoU Score:        {mean_iou:.4f} ± {std_iou:.4f}")
+    print(f"Pixel Accuracy:   {mean_acc:.4f} ± {std_acc:.4f}")
+    print(f"\nMin Dice: {min(test_dice_scores):.4f}")
+    print(f"Max Dice: {max(test_dice_scores):.4f}")
+    print(f"{'='*60}\n")
+    
+    # Save results JSON
+    results_dict = {
+        'summary': {
+            'num_test_images': len(test_imgs),
+            'mean_dice': float(mean_dice),
+            'std_dice': float(std_dice),
+            'mean_iou': float(mean_iou),
+            'std_iou': float(std_iou),
+            'mean_accuracy': float(mean_acc),
+            'std_accuracy': float(std_acc),
+            'min_dice': float(min(test_dice_scores)),
+            'max_dice': float(max(test_dice_scores))
+        },
+        'per_image_results': results
+    }
+    
+    results_path = output_dir / 'test_results.json'
+    with open(results_path, 'w') as f:
+        json.dump(results_dict, f, indent=2)
+    
+    print(f"Results saved to: {results_path}")
+    
+    # Plot distribution
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+    
+    axes[0].hist(test_dice_scores, bins=20, edgecolor='black', alpha=0.7)
+    axes[0].set_title(f'Dice Score Distribution\nMean: {mean_dice:.4f}')
+    axes[0].set_xlabel('Dice Score')
+    axes[0].set_ylabel('Frequency')
+    axes[0].axvline(mean_dice, color='red', linestyle='--', linewidth=2, label='Mean')
+    axes[0].legend()
+    axes[0].grid(alpha=0.3)
+    
+    axes[1].hist(test_iou_scores, bins=20, edgecolor='black', alpha=0.7)
+    axes[1].set_title(f'IoU Score Distribution\nMean: {mean_iou:.4f}')
+    axes[1].set_xlabel('IoU Score')
+    axes[1].set_ylabel('Frequency')
+    axes[1].axvline(mean_iou, color='red', linestyle='--', linewidth=2, label='Mean')
+    axes[1].legend()
+    axes[1].grid(alpha=0.3)
+    
+    axes[2].hist(test_accuracies, bins=20, edgecolor='black', alpha=0.7)
+    axes[2].set_title(f'Pixel Accuracy Distribution\nMean: {mean_acc:.4f}')
+    axes[2].set_xlabel('Accuracy')
+    axes[2].set_ylabel('Frequency')
+    axes[2].axvline(mean_acc, color='red', linestyle='--', linewidth=2, label='Mean')
+    axes[2].legend()
+    axes[2].grid(alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig(output_dir / 'test_metrics_distribution.png', dpi=150, bbox_inches='tight')
+    print(f"Distribution plots saved to: {output_dir / 'test_metrics_distribution.png'}")
+    plt.close()
+    
+    # Find best and worst performing images
+    sorted_predictions = sorted(predictions_data, key=lambda x: x['dice'])
+    
+    print("\nWorst 5 performing images:")
+    for i, pred_data in enumerate(sorted_predictions[:5]):
+        print(f"  {i+1}. Dice: {pred_data['dice']:.4f}, IoU: {pred_data['iou']:.4f} - {pred_data['image_name']}")
+        # Save worst visualizations
+        save_visualization(
+            pred_data['original_image'],
+            pred_data['ground_truth'],
+            pred_data['prediction'],
+            pred_data['dice'],
+            pred_data['iou'],
+            viz_worst_dir / f'worst_{i+1}_{pred_data["image_name"]}_dice{pred_data["dice"]:.4f}.png',
+            pred_data['image_name']
+        )
+    
+    print("\nBest 5 performing images:")
+    for i, pred_data in enumerate(sorted_predictions[-5:]):
+        print(f"  {i+1}. Dice: {pred_data['dice']:.4f}, IoU: {pred_data['iou']:.4f} - {pred_data['image_name']}")
+        # Save best visualizations
+        save_visualization(
+            pred_data['original_image'],
+            pred_data['ground_truth'],
+            pred_data['prediction'],
+            pred_data['dice'],
+            pred_data['iou'],
+            viz_best_dir / f'best_{i+1}_{pred_data["image_name"]}_dice{pred_data["dice"]:.4f}.png',
+            pred_data['image_name']
+        )
+    
+    # Create summary visualization with best and worst
+    fig, axes = plt.subplots(2, 5, figsize=(20, 8))
+    fig.suptitle('Best and Worst Predictions', fontsize=16, fontweight='bold')
+    
+    # Top row: worst 5
+    for i in range(5):
+        pred_data = sorted_predictions[i]
+        _, _, combined = create_overlay_visualization(
+            pred_data['original_image'],
+            pred_data['ground_truth'],
+            pred_data['prediction']
+        )
+        axes[0, i].imshow(combined)
+        axes[0, i].set_title(f'Worst {i+1}\nDice: {pred_data["dice"]:.3f}', fontsize=10)
+        axes[0, i].axis('off')
+    
+    # Bottom row: best 5
+    for i in range(5):
+        pred_data = sorted_predictions[-(i+1)]
+        _, _, combined = create_overlay_visualization(
+            pred_data['original_image'],
+            pred_data['ground_truth'],
+            pred_data['prediction']
+        )
+        axes[1, i].imshow(combined)
+        axes[1, i].set_title(f'Best {i+1}\nDice: {pred_data["dice"]:.3f}', fontsize=10)
+        axes[1, i].axis('off')
+    
+    plt.tight_layout()
+    plt.savefig(output_dir / 'best_worst_summary.png', dpi=150, bbox_inches='tight')
+    print(f"Best/Worst summary saved to: {output_dir / 'best_worst_summary.png'}")
+    plt.close()
+    
+    print(f"\n{'='*60}")
+    print(f"EVALUATION COMPLETE!")
+    print(f"{'='*60}")
+    print(f"All outputs saved to: {output_dir}")
+    print(f"  - test_results.json: Detailed metrics")
+    print(f"  - test_metrics_distribution.png: Score distributions")
+    print(f"  - best_worst_summary.png: Quick overview")
+    print(f"  - visualizations/all_predictions/: All {len(test_imgs)} predictions")
+    print(f"  - visualizations/best_predictions/: Top 5 predictions")
+    print(f"  - visualizations/worst_predictions/: Bottom 5 predictions")
+    print(f"{'='*60}\n")
+    
+    return results_dict
+
+if __name__ == "__main__":
+    model_path = '/Users/dinaal-amood/experiments/solar_panels_20250803_125145/best_modelswine.pth'
+    save_dir = '/Users/dinaal-amood/experiments/solar_panels_20250803_125145'
+    
+    results = evaluate_test_set(model_path, save_dir, device='cpu')
