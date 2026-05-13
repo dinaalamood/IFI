@@ -1,0 +1,547 @@
+"" 
+Requirements:
+torch
+torchvision
+numpy
+opencv-python
+matplotlib
+albumentations
+timm
+scikit-learn
+tqdm
+
+needs this folder structure:
+solar_training/          ← can be named anything, anywhere
+├── train.py             ← this script
+├── requirements.txt     ← this file
+├── training_images/     ← satellite tile PNGs
+├── training_masks/      ← mask PNGs (matching filenames)
+└── satlas_weights/      ← drop aerial_swinb_si.pth in here
+""
+
+"""
+Solar Panel Segmentation - Swin Transformer U-Net Training
+==========================================================
+
+SETUP INSTRUCTIONS:
+1. Install Python 3.10+ from https://www.python.org/downloads/
+
+2. Open Terminal (Mac) or Command Prompt (Windows) and run:
+       pip install -r requirements.txt
+
+3. Place your project folder like this:
+
+       solar_training/                  <-- this folder (can be named anything)
+       ├── train.py                     <-- this script
+       ├── requirements.txt             <-- install dependencies
+       ├── training_images/             <-- your satellite tile images (.png)
+       ├── training_masks/              <-- your binary mask images (.png)
+       └── satlas_weights/              <-- (optional) pretrained weights
+           └── aerial_swinb_si.pth
+
+   The image and mask filenames must match (e.g. tile_001.png in both folders).
+
+4. Run training:
+       cd path/to/solar_training
+       python train.py
+
+   All outputs (model, plots, logs) are saved to an 'experiments/' folder
+   created automatically inside this project folder.
+"""
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, Dataset
+import numpy as np
+from tqdm import tqdm
+import os
+from pathlib import Path
+import matplotlib.pyplot as plt
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
+import cv2
+import json
+import timm
+from sklearn.model_selection import train_test_split
+from datetime import datetime
+
+
+# ──────────────────────────────────────────────
+# AUTO-DETECT PATHS (works on any computer)
+# ──────────────────────────────────────────────
+# Everything is relative to where this script lives.
+# No need to edit paths — just put your folders next to this file.
+
+PROJECT_DIR = Path(__file__).resolve().parent
+
+IMAGES_DIR = PROJECT_DIR / "training_images"
+MASKS_DIR = PROJECT_DIR / "training_masks"
+SATLAS_WEIGHTS_DIR = PROJECT_DIR / "satlas_weights"
+EXPERIMENTS_DIR = PROJECT_DIR / "experiments"
+
+
+def find_satlas_weights():
+    """Search for satlas weights file in the weights folder."""
+    if not SATLAS_WEIGHTS_DIR.exists():
+        print("No satlas_weights/ folder found — training from scratch.")
+        return None
+
+    # Look for .pth files anywhere inside the weights folder
+    pth_files = list(SATLAS_WEIGHTS_DIR.rglob("*.pth"))
+    if pth_files:
+        print(f"Found pretrained weights: {pth_files[0]}")
+        return str(pth_files[0])
+
+    print("No .pth file found in satlas_weights/ — training from scratch.")
+    return None
+
+
+class Config:
+    def __init__(self):
+        # Auto-detected paths
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.save_dir = EXPERIMENTS_DIR / f"solar_panels_{timestamp}"
+        self.satlas_weights_path = find_satlas_weights()
+
+        # Model parameters
+        self.encoder_name = "swin_base_patch4_window7_224"
+        self.input_size = 224
+        self.num_classes = 1
+
+        # Training parameters
+        self.batch_size = 8
+        self.num_epochs = 40
+        self.learning_rate = 1e-4
+        self.weight_decay = 1e-4
+
+        # Early stopping
+        self.patience = 8
+        self.min_delta = 0.001
+
+        # Device — automatically uses GPU if available
+        if torch.cuda.is_available():
+            self.device = "cuda"
+        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            self.device = "mps"  # Apple Silicon GPU
+        else:
+            self.device = "cpu"
+
+        # Random seed
+        self.random_seed = 42
+
+
+# ──────────────────────────────────────────────
+# DATASET
+# ──────────────────────────────────────────────
+
+class SolarDataset(Dataset):
+    def __init__(self, image_paths, mask_paths, transform=None):
+        self.image_paths = image_paths
+        self.mask_paths = mask_paths
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.image_paths)
+
+    def __getitem__(self, idx):
+        image = cv2.imread(self.image_paths[idx])
+        if image is None:
+            raise ValueError(f"Could not load image: {self.image_paths[idx]}")
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+
+        mask = cv2.imread(self.mask_paths[idx], cv2.IMREAD_GRAYSCALE)
+        if mask is None:
+            raise ValueError(f"Could not load mask: {self.mask_paths[idx]}")
+        mask = (mask > 127).astype(np.float32)
+
+        if self.transform:
+            augmented = self.transform(image=image, mask=mask)
+            image = augmented["image"]
+            mask = augmented["mask"]
+
+        if len(mask.shape) == 2:
+            mask = mask.unsqueeze(0)
+
+        return image, mask
+
+
+# ──────────────────────────────────────────────
+# AUGMENTATIONS
+# ──────────────────────────────────────────────
+
+def get_train_augmentation(input_size):
+    return A.Compose([
+        A.Resize(input_size, input_size),
+        A.HorizontalFlip(p=0.5),
+        A.VerticalFlip(p=0.5),
+        A.RandomRotate90(p=0.5),
+        A.ShiftScaleRotate(shift_limit=0.1, scale_limit=0.1, rotate_limit=15, p=0.5),
+        A.RandomBrightnessContrast(brightness_limit=0.1, contrast_limit=0.1, p=0.3),
+        A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+        ToTensorV2(),
+    ])
+
+
+def get_val_augmentation(input_size):
+    return A.Compose([
+        A.Resize(input_size, input_size),
+        A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+        ToTensorV2(),
+    ])
+
+
+# ──────────────────────────────────────────────
+# MODEL ARCHITECTURE
+# ──────────────────────────────────────────────
+
+class DecoderBlock(nn.Module):
+    def __init__(self, in_channels, skip_channels, out_channels):
+        super().__init__()
+        self.conv1 = nn.Conv2d(in_channels + skip_channels, out_channels, 3, padding=1)
+        self.bn1 = nn.BatchNorm2d(out_channels)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, 3, padding=1)
+        self.bn2 = nn.BatchNorm2d(out_channels)
+        self.relu = nn.ReLU(inplace=True)
+
+    def forward(self, x, skip=None):
+        x = nn.functional.interpolate(x, scale_factor=2, mode="bilinear", align_corners=True)
+        if skip is not None:
+            if x.shape[2:] != skip.shape[2:]:
+                skip = nn.functional.interpolate(skip, size=x.shape[2:], mode="bilinear", align_corners=True)
+            x = torch.cat([x, skip], dim=1)
+        x = self.relu(self.bn1(self.conv1(x)))
+        x = self.relu(self.bn2(self.conv2(x)))
+        return x
+
+
+class SwinFeatureExtractor(nn.Module):
+    def __init__(self, swin_model):
+        super().__init__()
+        self.patch_embed = swin_model.patch_embed
+        self.layers = swin_model.layers
+        self.pos_drop = getattr(swin_model, "pos_drop", nn.Identity())
+        self.norm = getattr(swin_model, "norm", nn.Identity())
+
+    def forward(self, x):
+        features = []
+        x = self.patch_embed(x)
+        x = self.pos_drop(x)
+
+        for layer in self.layers:
+            x = layer(x)
+            if len(x.shape) == 4:
+                feature = x.permute(0, 3, 1, 2).contiguous()
+            else:
+                B, L, C = x.shape
+                H = W = int(L ** 0.5)
+                feature = x.view(B, H, W, C).permute(0, 3, 1, 2).contiguous()
+            features.append(feature)
+
+        return features
+
+
+class SwinUNet(nn.Module):
+    def __init__(self, encoder_name, satlas_weights_path=None, num_classes=1):
+        super().__init__()
+
+        full_model = timm.create_model(encoder_name, pretrained=False, num_classes=0)
+
+        if satlas_weights_path and os.path.exists(satlas_weights_path):
+            print(f"Loading Satlas weights from {satlas_weights_path}")
+            try:
+                state_dict = torch.load(satlas_weights_path, map_location="cpu")
+                if "model" in state_dict:
+                    state_dict = state_dict["model"]
+                elif "state_dict" in state_dict:
+                    state_dict = state_dict["state_dict"]
+                missing, unexpected = full_model.load_state_dict(state_dict, strict=False)
+                print(f"Weights loaded. Missing: {len(missing)}, Unexpected: {len(unexpected)}")
+            except Exception as e:
+                print(f"Warning: Could not load weights: {e}")
+        else:
+            print("No pretrained weights — training from scratch.")
+
+        self.encoder = SwinFeatureExtractor(full_model)
+
+        with torch.no_grad():
+            dummy = torch.randn(1, 3, 224, 224)
+            features = self.encoder(dummy)
+            enc_ch = [f.shape[1] for f in features]
+            print(f"Encoder channels: {enc_ch}")
+
+        self.decoder4 = DecoderBlock(enc_ch[3], enc_ch[2], 512)
+        self.decoder3 = DecoderBlock(512, enc_ch[1], 256)
+        self.decoder2 = DecoderBlock(256, enc_ch[0], 128)
+        self.decoder1 = DecoderBlock(128, 0, 64)
+
+        self.segmentation_head = nn.Sequential(
+            nn.Conv2d(64, 32, 3, padding=1),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, num_classes, 1),
+        )
+
+    def forward(self, x):
+        input_size = x.shape[2:]
+        feats = self.encoder(x)
+        d4 = self.decoder4(feats[3], feats[2])
+        d3 = self.decoder3(d4, feats[1])
+        d2 = self.decoder2(d3, feats[0])
+        d1 = self.decoder1(d2)
+        d1 = nn.functional.interpolate(d1, size=input_size, mode="bilinear", align_corners=True)
+        return self.segmentation_head(d1)
+
+
+# ──────────────────────────────────────────────
+# LOSS FUNCTIONS & METRICS
+# ──────────────────────────────────────────────
+
+def dice_loss(pred, target, smooth=1e-6):
+    pred = torch.sigmoid(pred).contiguous().view(-1)
+    target = target.contiguous().view(-1)
+    intersection = (pred * target).sum()
+    return 1 - (2.0 * intersection + smooth) / (pred.sum() + target.sum() + smooth)
+
+
+def combined_loss(pred, target):
+    return nn.BCEWithLogitsLoss()(pred, target) + dice_loss(pred, target)
+
+
+def dice_coefficient(pred, target, threshold=0.5):
+    pred = (torch.sigmoid(pred) > threshold).float()
+    intersection = (pred * target.float()).sum()
+    return (2.0 * intersection / (pred.sum() + target.float().sum() + 1e-8)).item()
+
+
+def iou_score(pred, target, threshold=0.5):
+    pred = (torch.sigmoid(pred) > threshold).float()
+    intersection = (pred * target.float()).sum()
+    union = pred.sum() + target.float().sum() - intersection
+    return (intersection / (union + 1e-8)).item()
+
+
+# ──────────────────────────────────────────────
+# DATA PREPARATION
+# ──────────────────────────────────────────────
+
+def prepare_datasets(config):
+    extensions = ["*.png", "*.jpg", "*.jpeg", "*.tif", "*.tiff"]
+
+    image_paths = []
+    for ext in extensions:
+        image_paths.extend(list(IMAGES_DIR.glob(ext)))
+    image_paths = sorted(image_paths)
+
+    print(f"Images folder: {IMAGES_DIR}")
+    print(f"Masks folder:  {MASKS_DIR}")
+    print(f"Found {len(image_paths)} images")
+    print(f"Found {len(list(MASKS_DIR.glob('*.png')))} masks")
+
+    if len(image_paths) == 0:
+        raise ValueError(
+            f"No images found in {IMAGES_DIR}.\n"
+            "Make sure you have a 'training_images/' folder next to this script."
+        )
+
+    valid_pairs = []
+    for img in image_paths:
+        mask = MASKS_DIR / (img.stem + ".png")
+        if mask.exists():
+            valid_pairs.append((str(img), str(mask)))
+
+    print(f"Found {len(valid_pairs)} valid image-mask pairs")
+
+    if len(valid_pairs) == 0:
+        print("\nSample image filenames:")
+        for img in image_paths[:10]:
+            print(f"  IMAGE: {img.name}")
+        print("\nSample mask filenames:")
+        for mask in sorted(list(MASKS_DIR.glob("*.png")))[:10]:
+            print(f"  MASK:  {mask.name}")
+        raise ValueError(
+            "No matching image-mask pairs found.\n"
+            "Image and mask filenames must match (e.g. tile_001.png in both folders)."
+        )
+
+    img_list, mask_list = zip(*valid_pairs)
+
+    train_imgs, val_imgs, train_masks, val_masks = train_test_split(
+        list(img_list), list(mask_list),
+        test_size=0.2, random_state=config.random_seed,
+    )
+
+    split_info = {
+        "train_count": len(train_imgs),
+        "val_count": len(val_imgs),
+        "random_seed": config.random_seed,
+        "train_images": train_imgs,
+        "val_images": val_imgs,
+        "train_masks": train_masks,
+        "val_masks": val_masks,
+    }
+
+    os.makedirs(config.save_dir, exist_ok=True)
+    with open(config.save_dir / "dataset_split_info.json", "w") as f:
+        json.dump(split_info, f, indent=2)
+
+    train_ds = SolarDataset(train_imgs, train_masks, get_train_augmentation(config.input_size))
+    val_ds = SolarDataset(val_imgs, val_masks, get_val_augmentation(config.input_size))
+
+    print(f"\nDataset split: Train={len(train_imgs)}, Val={len(val_imgs)}")
+    return train_ds, val_ds, split_info
+
+
+# ──────────────────────────────────────────────
+# TRAINING LOOP
+# ──────────────────────────────────────────────
+
+def train_epoch(model, dataloader, criterion, optimizer, device):
+    model.train()
+    total_loss = total_dice = total_iou = 0.0
+
+    pbar = tqdm(dataloader, desc="Training")
+    for images, masks in pbar:
+        images, masks = images.to(device), masks.to(device)
+        optimizer.zero_grad()
+        outputs = model(images)
+        loss = criterion(outputs, masks)
+        loss.backward()
+        optimizer.step()
+
+        total_loss += loss.item()
+        total_dice += dice_coefficient(outputs, masks)
+        total_iou += iou_score(outputs, masks)
+        pbar.set_postfix(loss=f"{loss.item():.4f}", dice=f"{dice_coefficient(outputs, masks):.4f}")
+
+    n = len(dataloader)
+    return total_loss / n, total_dice / n, total_iou / n
+
+
+def validate(model, dataloader, criterion, device):
+    model.eval()
+    total_loss = total_dice = total_iou = 0.0
+
+    with torch.no_grad():
+        for images, masks in tqdm(dataloader, desc="Validation"):
+            images, masks = images.to(device), masks.to(device)
+            outputs = model(images)
+            loss = criterion(outputs, masks)
+            total_loss += loss.item()
+            total_dice += dice_coefficient(outputs, masks)
+            total_iou += iou_score(outputs, masks)
+
+    n = len(dataloader)
+    return total_loss / n, total_dice / n, total_iou / n
+
+
+def plot_training_curves(history, save_dir):
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+    for ax, metric, title in zip(
+        axes,
+        [("train_loss", "val_loss"), ("train_dice", "val_dice"), ("train_iou", "val_iou")],
+        ["Loss", "Dice Score", "IoU Score"],
+    ):
+        ax.plot(history[metric[0]], label="Train")
+        ax.plot(history[metric[1]], label="Val")
+        ax.set_title(title)
+        ax.set_xlabel("Epoch")
+        ax.legend()
+    plt.tight_layout()
+    plt.savefig(save_dir / "training_curves.png", dpi=150, bbox_inches="tight")
+    plt.close()
+
+
+def train(config):
+    torch.manual_seed(config.random_seed)
+    np.random.seed(config.random_seed)
+
+    train_ds, val_ds, split_info = prepare_datasets(config)
+
+    train_loader = DataLoader(train_ds, batch_size=config.batch_size, shuffle=True, num_workers=0)
+    val_loader = DataLoader(val_ds, batch_size=config.batch_size, shuffle=False, num_workers=0)
+
+    print(f"\nInitializing Swin Transformer U-Net...")
+    model = SwinUNet(
+        encoder_name=config.encoder_name,
+        satlas_weights_path=config.satlas_weights_path,
+        num_classes=config.num_classes,
+    ).to(config.device)
+
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f"Total parameters: {total_params:,}")
+
+    criterion = combined_loss
+    optimizer = optim.AdamW(model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="max", factor=0.5, patience=5)
+
+    best_dice = 0.0
+    patience_counter = 0
+    history = {k: [] for k in ["train_loss", "train_dice", "train_iou", "val_loss", "val_dice", "val_iou"]}
+
+    print(f"\nStarting training for {config.num_epochs} epochs")
+    print(f"Device: {config.device}")
+    print(f"Input size: {config.input_size}x{config.input_size}")
+    print(f"Results will be saved to: {config.save_dir}\n")
+
+    for epoch in range(config.num_epochs):
+        print(f"\nEpoch {epoch + 1}/{config.num_epochs}  (LR: {optimizer.param_groups[0]['lr']:.6f})")
+
+        tl, td, ti = train_epoch(model, train_loader, criterion, optimizer, config.device)
+        vl, vd, vi = validate(model, val_loader, criterion, config.device)
+        scheduler.step(vd)
+
+        history["train_loss"].append(tl)
+        history["train_dice"].append(td)
+        history["train_iou"].append(ti)
+        history["val_loss"].append(vl)
+        history["val_dice"].append(vd)
+        history["val_iou"].append(vi)
+
+        print(f"Train — Loss: {tl:.4f}, Dice: {td:.4f}, IoU: {ti:.4f}")
+        print(f"Val   — Loss: {vl:.4f}, Dice: {vd:.4f}, IoU: {vi:.4f}")
+
+        if vd > best_dice + config.min_delta:
+            best_dice = vd
+            patience_counter = 0
+            torch.save(
+                {
+                    "epoch": epoch,
+                    "model_state_dict": model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "scheduler_state_dict": scheduler.state_dict(),
+                    "val_dice": vd,
+                    "val_iou": vi,
+                },
+                config.save_dir / "best_model.pth",
+            )
+            print(f"New best model saved! Dice: {best_dice:.4f}")
+        else:
+            patience_counter += 1
+            print(f"No improvement ({patience_counter}/{config.patience})")
+
+        if patience_counter >= config.patience:
+            print(f"\nEarly stopping after {epoch + 1} epochs")
+            break
+
+    np.save(config.save_dir / "training_history.npy", history)
+    plot_training_curves(history, config.save_dir)
+
+    print(f"\nTraining complete!")
+    print(f"Best validation Dice: {best_dice:.4f}")
+    print(f"Model saved to: {config.save_dir / 'best_model.pth'}")
+
+
+if __name__ == "__main__":
+    # Print system info
+    print("=" * 50)
+    print("SOLAR PANEL SEGMENTATION TRAINER")
+    print("=" * 50)
+    print(f"Project folder: {PROJECT_DIR}")
+    print(f"Python: {os.sys.version}")
+    print(f"PyTorch: {torch.__version__}")
+    print(f"GPU available: {torch.cuda.is_available() or (hasattr(torch.backends, 'mps') and torch.backends.mps.is_available())}")
+    print("=" * 50)
+
+    config = Config()
+    train(config)
