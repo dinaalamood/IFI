@@ -1,0 +1,284 @@
+"""
+Solar Panel Inference  to run predictions on new images.
+
+SETUP:
+    Place this script in your project folder:
+
+        solar_training/
+        ├── train.py
+        ├── inference.py              ← this script
+        ├── requirements.txt
+        ├── new_images/               ← put images to predict here
+        ├── experiments/
+        │   └── solar_panels_.../
+        │       └── best_model.pth    ← auto-found by the script
+        └── predictions/              ← created automatically
+
+    Then run:
+        python inference.py
+
+    The script will automatically run trained model
+    on everything in new_images/.
+
+    Or specify paths manually
+        python inference.py --model_path path/to/model.pth \
+                            --images_dir path/to/images \
+                            --output_dir path/to/output
+"""
+
+import torch
+import torch.nn as nn
+import numpy as np
+import cv2
+import os
+import argparse
+import timm
+from pathlib import Path
+from glob import glob
+import matplotlib.pyplot as plt
+from tqdm import tqdm
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
+
+
+# ── Auto-detect paths ────────────────────────────────────────────────
+
+PROJECT_DIR = Path(__file__).resolve().parent
+
+
+def auto_detect_device():
+    """Pick the best available device."""
+    if torch.cuda.is_available():
+        return "cuda"
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
+
+
+def find_latest_model():
+    """Find the most recent best_model.pth in experiments/."""
+    experiments = PROJECT_DIR / "experiments"
+    if not experiments.exists():
+        return None
+
+    # Search all experiment folders for model files
+    model_files = sorted(experiments.rglob("best_model*.pth"))
+    if not model_files:
+        return None
+
+    # Return the most recently modified one
+    latest = max(model_files, key=lambda p: p.stat().st_mtime)
+    return str(latest)
+
+
+# ── Model classes (same as training script) ──────────────────────────
+
+class DecoderBlock(nn.Module):
+    def __init__(self, in_channels, skip_channels, out_channels):
+        super().__init__()
+        self.conv1 = nn.Conv2d(in_channels + skip_channels, out_channels, 3, padding=1)
+        self.bn1 = nn.BatchNorm2d(out_channels)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, 3, padding=1)
+        self.bn2 = nn.BatchNorm2d(out_channels)
+        self.relu = nn.ReLU(inplace=True)
+
+    def forward(self, x, skip=None):
+        x = nn.functional.interpolate(x, scale_factor=2, mode='bilinear', align_corners=True)
+        if skip is not None:
+            if x.shape[2:] != skip.shape[2:]:
+                skip = nn.functional.interpolate(skip, size=x.shape[2:], mode='bilinear', align_corners=True)
+            x = torch.cat([x, skip], dim=1)
+        x = self.relu(self.bn1(self.conv1(x)))
+        x = self.relu(self.bn2(self.conv2(x)))
+        return x
+
+
+class SwinFeatureExtractor(nn.Module):
+    def __init__(self, swin_model):
+        super().__init__()
+        self.patch_embed = swin_model.patch_embed
+        self.layers = swin_model.layers
+        self.pos_drop = getattr(swin_model, 'pos_drop', nn.Identity())
+        self.norm = getattr(swin_model, 'norm', nn.Identity())
+
+    def forward(self, x):
+        features = []
+        x = self.patch_embed(x)
+        x = self.pos_drop(x)
+        for layer in self.layers:
+            x = layer(x)
+            if len(x.shape) == 4:
+                feature = x.permute(0, 3, 1, 2).contiguous()
+            else:
+                B, L, C = x.shape
+                H = W = int(L ** 0.5)
+                feature = x.view(B, H, W, C).permute(0, 3, 1, 2).contiguous()
+            features.append(feature)
+        return features
+
+
+class SwinUNet(nn.Module):
+    def __init__(self, encoder_name='swin_base_patch4_window7_224',
+                 encoder_channels=[128, 256, 512, 1024], num_classes=1):
+        super().__init__()
+        full_model = timm.create_model(encoder_name, pretrained=False, num_classes=0)
+        self.encoder = SwinFeatureExtractor(full_model)
+        self.decoder4 = DecoderBlock(encoder_channels[3], encoder_channels[2], 512)
+        self.decoder3 = DecoderBlock(512, encoder_channels[1], 256)
+        self.decoder2 = DecoderBlock(256, encoder_channels[0], 128)
+        self.decoder1 = DecoderBlock(128, 0, 64)
+        self.segmentation_head = nn.Sequential(
+            nn.Conv2d(64, 32, 3, padding=1),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, num_classes, 1),
+        )
+
+    def forward(self, x):
+        input_size = x.shape[2:]
+        enc = self.encoder(x)
+        d4 = self.decoder4(enc[3], enc[2])
+        d3 = self.decoder3(d4, enc[1])
+        d2 = self.decoder2(d3, enc[0])
+        d1 = self.decoder1(d2)
+        d1 = nn.functional.interpolate(d1, size=input_size, mode='bilinear', align_corners=True)
+        return self.segmentation_head(d1)
+
+
+# ── Inference ────────────────────────────────────────────────────────
+
+def preprocess(image, input_size=224):
+    transform = A.Compose([
+        A.Resize(input_size, input_size),
+        A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+        ToTensorV2(),
+    ])
+    return transform(image=image)['image']
+
+
+def run_inference(model_path, images_dir, output_dir, device='cpu', threshold=0.5):
+    output_dir = Path(output_dir)
+    masks_dir = output_dir / 'masks'
+    viz_dir = output_dir / 'visualizations'
+    masks_dir.mkdir(parents=True, exist_ok=True)
+    viz_dir.mkdir(parents=True, exist_ok=True)
+
+    # Collect images
+    image_paths = []
+    for ext in ['*.png', '*.jpg', '*.jpeg', '*.tif', '*.tiff', '*.bmp']:
+        image_paths.extend(glob(os.path.join(images_dir, ext)))
+    image_paths = sorted(image_paths)
+
+    if len(image_paths) == 0:
+        print(f"ERROR: No images found in {images_dir}")
+        return
+
+    print(f"Found {len(image_paths)} images in {images_dir}")
+
+    # Load model
+    print(f"Loading model from {model_path}")
+    checkpoint = torch.load(model_path, map_location=device, weights_only=False)
+
+    model = SwinUNet(
+        encoder_name='swin_base_patch4_window7_224',
+        encoder_channels=[128, 256, 512, 1024],
+        num_classes=1,
+    )
+    model.load_state_dict(checkpoint['model_state_dict'])
+    model = model.to(device)
+    model.eval()
+
+    epoch_info = checkpoint.get('epoch', '?')
+    dice_info = checkpoint.get('val_dice', 0)
+    if isinstance(epoch_info, int):
+        epoch_info += 1
+    print(f"Model loaded (trained for {epoch_info} epochs, val Dice: {dice_info:.4f})")
+    print(f"Device: {device}")
+    print(f"Threshold: {threshold}\n")
+
+    # Run inference
+    for img_path in tqdm(image_paths, desc="Running inference"):
+        image_bgr = cv2.imread(img_path)
+        if image_bgr is None:
+            print(f"  WARNING: Could not read {img_path}, skipping")
+            continue
+        image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+        orig_h, orig_w = image_rgb.shape[:2]
+
+        input_tensor = preprocess(image_rgb).unsqueeze(0).to(device)
+
+        with torch.no_grad():
+            output = model(input_tensor)
+            prob_map = torch.sigmoid(output).cpu().numpy()[0, 0]
+
+        prob_full = cv2.resize(prob_map, (orig_w, orig_h), interpolation=cv2.INTER_LINEAR)
+        mask_binary = (prob_full > threshold).astype(np.uint8) * 255
+
+        stem = Path(img_path).stem
+        cv2.imwrite(str(masks_dir / f'{stem}.png'), mask_binary)
+
+        # Visualization
+        overlay = image_rgb.copy()
+        color_mask = np.zeros_like(overlay)
+        color_mask[mask_binary > 0] = [0, 120, 255]
+        overlay = cv2.addWeighted(overlay, 0.6, color_mask, 0.4, 0)
+
+        fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+        axes[0].imshow(image_rgb)
+        axes[0].set_title('Original')
+        axes[0].axis('off')
+
+        axes[1].imshow(mask_binary, cmap='gray')
+        axes[1].set_title('Predicted Mask')
+        axes[1].axis('off')
+
+        axes[2].imshow(overlay)
+        axes[2].set_title('Overlay')
+        axes[2].axis('off')
+
+        fig.suptitle(stem, fontsize=14, fontweight='bold')
+        plt.tight_layout()
+        plt.savefig(str(viz_dir / f'{stem}.png'), dpi=150, bbox_inches='tight')
+        plt.close()
+
+    print(f"\nDone!")
+    print(f"  Binary masks   -> {masks_dir}")
+    print(f"  Visualizations -> {viz_dir}")
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description="Run solar panel inference on new images")
+    parser.add_argument('--model_path', type=str, default=None,
+                        help='Path to model .pth file (auto-detected if not provided)')
+    parser.add_argument('--images_dir', type=str, default=None,
+                        help='Folder of images to predict (default: new_images/)')
+    parser.add_argument('--output_dir', type=str, default=None,
+                        help='Where to save results (default: predictions/)')
+    parser.add_argument('--threshold', type=float, default=0.5,
+                        help='Confidence threshold (default: 0.5)')
+    parser.add_argument('--device', type=str, default=None,
+                        help='Device: cpu, cuda, or mps (auto-detected if not provided)')
+    args = parser.parse_args()
+
+    # Auto-detect everything that wasn't specified
+    model_path = args.model_path or find_latest_model()
+    images_dir = args.images_dir or str(PROJECT_DIR / "new_images")
+    output_dir = args.output_dir or str(PROJECT_DIR / "predictions")
+    device = args.device or auto_detect_device()
+
+    print("=" * 50)
+    print("SOLAR PANEL INFERENCE")
+    print("=" * 50)
+    print(f"Project folder: {PROJECT_DIR}")
+    print(f"Model:          {model_path or 'NOT FOUND'}")
+    print(f"Images:         {images_dir}")
+    print(f"Output:         {output_dir}")
+    print(f"Device:         {device}")
+    print("=" * 50)
+
+    if model_path is None:
+        print("\nERROR: No trained model found.")
+        print("Either run train.py first, or specify --model_path manually.")
+    else:
+        run_inference(model_path, images_dir, output_dir,
+                      device=device, threshold=args.threshold)
